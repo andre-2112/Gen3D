@@ -988,23 +988,716 @@ aws events put-targets \
 
 ---
 
+## 🎯 Solution 3: EventBridge + S3 (Most Elegant)
+
+The simplest and most cost-effective solution: use S3 itself as the queue storage.
+
+### Key Insight
+
+**All our data is already in S3** (images, masks, outputs). Why introduce a separate database (DynamoDB) for queue management when we can use S3 as both data store AND queue?
+
+### Architecture Diagram:
+
+```
+User uploads → S3 → Lambda 1 (trigger)
+                         ↓
+                    - Start endpoint (if needed)
+                    - Create pending request JSON in S3
+                    - Return immediately
+
+CloudWatch Events → Detects endpoint status change to "InService"
+                         ↓
+                    EventBridge Rule triggers Lambda 2
+                         ↓
+                    Lambda 2:
+                    - List all pending/*.json files in S3
+                    - For each: Move to processing/ folder
+                    - Process inference
+                    - Move to completed/ or failed/ folder
+```
+
+### S3 Bucket Structure:
+
+```
+s3://gen3d-data-bucket/
+├── users/
+│   └── {userId}/
+│       ├── input/
+│       │   ├── {timestamp}_image.png
+│       │   └── {timestamp}_mask.png
+│       ├── output/
+│       │   ├── {timestamp}.ply
+│       │   └── {timestamp}_error.json (if failed)
+│       └── queue/
+│           ├── pending/
+│           │   └── {requestId}.json
+│           ├── processing/
+│           │   └── {requestId}.json
+│           ├── completed/
+│           │   └── {requestId}.json
+│           └── failed/
+│               └── {requestId}.json
+```
+
+### Request JSON Format:
+
+```json
+{
+  "requestId": "user123-1234567890-abc123",
+  "userId": "user123",
+  "imageKey": "users/user123/input/1234567890_image.png",
+  "maskKey": "users/user123/input/1234567890_mask.png",
+  "bucket": "gen3d-data-bucket",
+  "status": "pending",
+  "createdAt": "2025-11-27T10:30:00Z",
+  "timestamp": 1234567890
+}
+```
+
+### Benefits:
+
+- ✅ **Simplest architecture** - no additional database service
+- ✅ **Lowest cost** - S3 is ~20x cheaper than DynamoDB
+- ✅ **Natural organization** - request metadata lives with the data
+- ✅ **Easy debugging** - just browse S3 folders to see queue status
+- ✅ **No capacity planning** - S3 auto-scales infinitely
+- ✅ **Visual inspection** - see queue state directly in S3 console
+- ✅ **Atomic operations** - copy+delete prevents race conditions
+- ✅ **Built-in lifecycle** - use S3 lifecycle policies for cleanup
+- ✅ **Audit trail** - completed/failed requests preserved automatically
+
+---
+
+## Implementation: EventBridge + S3 Solution
+
+### Step 1: Lambda 1 - Queue Request in S3
+
+**File**: `lambda_queue_s3.py`
+
+```python
+import boto3
+import json
+import time
+import uuid
+
+s3_client = boto3.client('s3')
+sagemaker_client = boto3.client('sagemaker')
+
+ENDPOINT_NAME = 'Gen3DSAMEndpoint'
+DATA_BUCKET = 'gen3d-data-bucket'
+
+def lambda_handler(event, context):
+    """
+    Start endpoint (if needed) and queue request as JSON file in S3.
+    Returns immediately without waiting.
+    """
+
+    # Parse S3 event
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = event['Records'][0]['s3']['object']['key']
+
+    print(f"Received upload: {bucket}/{key}")
+
+    if not key.endswith('_image.png'):
+        print("Skipping non-image file")
+        return {'statusCode': 200, 'body': 'Skipped'}
+
+    # Extract metadata
+    # Expected format: users/{userId}/input/{timestamp}_image.png
+    parts = key.split('/')
+    if len(parts) < 4 or parts[0] != 'users' or parts[2] != 'input':
+        print("Invalid key format")
+        return {'statusCode': 400, 'body': 'Invalid path'}
+
+    user_id = parts[1]
+    filename = parts[3]
+    base_name = filename.replace('_image.png', '')
+    mask_key = f"users/{user_id}/input/{base_name}_mask.png"
+
+    # Verify mask exists
+    try:
+        s3_client.head_object(Bucket=bucket, Key=mask_key)
+        print(f"✓ Found mask: {mask_key}")
+    except:
+        print(f"✗ Mask not found: {mask_key}")
+        return {'statusCode': 400, 'body': 'Mask missing'}
+
+    # Check endpoint status
+    try:
+        response = sagemaker_client.describe_endpoint(EndpointName=ENDPOINT_NAME)
+        endpoint_status = response['EndpointStatus']
+        print(f"Endpoint status: {endpoint_status}")
+    except Exception as e:
+        print(f"Endpoint not found: {e}")
+        endpoint_status = 'NotFound'
+
+    # If not running, start it
+    if endpoint_status != 'InService':
+        print("⚠️ Endpoint not ready. Starting endpoint...")
+        try:
+            sagemaker_client.update_endpoint(
+                EndpointName=ENDPOINT_NAME,
+                EndpointConfigName='Gen3DSAM-Config'
+            )
+            print("✓ Endpoint start initiated")
+        except Exception as e:
+            print(f"⚠️ Start endpoint error (may already be starting): {e}")
+
+    # Generate request ID
+    timestamp = int(time.time())
+    request_id = f"{user_id}-{timestamp}-{str(uuid.uuid4())[:8]}"
+
+    # Create request metadata JSON
+    request_data = {
+        'requestId': request_id,
+        'userId': user_id,
+        'imageKey': key,
+        'maskKey': mask_key,
+        'bucket': bucket,
+        'status': 'pending',
+        'createdAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'timestamp': timestamp
+    }
+
+    # Save request to S3 queue (pending folder)
+    queue_key = f"users/{user_id}/queue/pending/{request_id}.json"
+
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=queue_key,
+            Body=json.dumps(request_data, indent=2),
+            ContentType='application/json',
+            Metadata={
+                'request-id': request_id,
+                'user-id': user_id,
+                'status': 'pending'
+            }
+        )
+        print(f"✓ Queued request: {queue_key}")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Request queued. Will process when endpoint is ready.',
+                'requestId': request_id,
+                'queueKey': queue_key
+            })
+        }
+
+    except Exception as e:
+        print(f"✗ Failed to queue request: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+```
+
+**Lambda Configuration:**
+```bash
+# Create Lambda function
+zip -j lambda_queue_s3.zip lambda_queue_s3.py
+
+aws lambda create-function \
+    --function-name Gen3DQueueS3Lambda \
+    --runtime python3.11 \
+    --role arn:aws:iam::ACCOUNT_ID:role/Gen3DLambdaRole \
+    --handler lambda_queue_s3.lambda_handler \
+    --zip-file fileb://lambda_queue_s3.zip \
+    --timeout 30 \
+    --memory-size 256 \
+    --environment "Variables={
+        ENDPOINT_NAME=Gen3DSAMEndpoint,
+        DATA_BUCKET=gen3d-data-bucket
+    }"
+```
+
+---
+
+### Step 2: Create EventBridge Rule
+
+```bash
+# Create EventBridge rule that triggers when endpoint becomes InService
+aws events put-rule \
+    --name Gen3D-EndpointReady-S3 \
+    --description "Trigger when SageMaker endpoint becomes InService" \
+    --event-pattern '{
+      "source": ["aws.sagemaker"],
+      "detail-type": ["SageMaker Endpoint State Change"],
+      "detail": {
+        "EndpointName": ["Gen3DSAMEndpoint"],
+        "EndpointStatus": ["InService"]
+      }
+    }'
+
+# Add Lambda as target
+aws events put-targets \
+    --rule Gen3D-EndpointReady-S3 \
+    --targets "Id"="1","Arn"="arn:aws:lambda:us-east-1:ACCOUNT_ID:function:Gen3DProcessS3QueueLambda"
+
+# Grant EventBridge permission to invoke Lambda
+aws lambda add-permission \
+    --function-name Gen3DProcessS3QueueLambda \
+    --statement-id AllowEventBridgeS3 \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn arn:aws:events:us-east-1:ACCOUNT_ID:rule/Gen3D-EndpointReady-S3
+```
+
+---
+
+### Step 3: Lambda 2 - Process S3 Queue
+
+**File**: `lambda_process_s3_queue.py`
+
+```python
+import boto3
+import json
+import base64
+import time
+
+s3_client = boto3.client('s3')
+sagemaker_runtime = boto3.client('sagemaker-runtime')
+lambda_client = boto3.client('lambda')
+
+ENDPOINT_NAME = 'Gen3DSAMEndpoint'
+DATA_BUCKET = 'gen3d-data-bucket'
+
+def lambda_handler(event, context):
+    """
+    Triggered when endpoint becomes InService.
+    Process all pending requests from S3 queue.
+    """
+
+    print("🚀 Endpoint is ready! Processing S3 queue...")
+    print(f"Event: {json.dumps(event)}")
+
+    # List all pending request files across all users
+    pending_requests = []
+
+    try:
+        # List all pending/*.json files
+        # Using prefix to scan all users
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(
+            Bucket=DATA_BUCKET,
+            Prefix='users/'
+        )
+
+        for page in pages:
+            if 'Contents' not in page:
+                continue
+
+            for obj in page['Contents']:
+                key = obj['Key']
+                # Check if this is a pending request file
+                if '/queue/pending/' in key and key.endswith('.json'):
+                    pending_requests.append(key)
+
+        print(f"📋 Found {len(pending_requests)} pending requests")
+
+    except Exception as e:
+        print(f"✗ Failed to list pending requests: {e}")
+        return {'statusCode': 500, 'error': str(e)}
+
+    # Process each request
+    processed = 0
+    failed = 0
+
+    for request_key in pending_requests:
+        print(f"\n🔄 Processing {request_key}...")
+
+        try:
+            # ATOMIC OPERATION: Move from pending/ to processing/
+            # This prevents race conditions if multiple Lambdas run concurrently
+
+            processing_key = request_key.replace('/queue/pending/', '/queue/processing/')
+
+            # Step 1: Copy to processing/
+            s3_client.copy_object(
+                Bucket=DATA_BUCKET,
+                CopySource={'Bucket': DATA_BUCKET, 'Key': request_key},
+                Key=processing_key
+            )
+
+            # Step 2: Delete from pending/ (if this fails, someone else got it)
+            try:
+                s3_client.delete_object(Bucket=DATA_BUCKET, Key=request_key)
+                print(f"  ✓ Moved to processing")
+            except Exception as delete_error:
+                print(f"  ⚠️ Could not delete pending (already processed?): {delete_error}")
+                # Someone else is processing this - skip it
+                s3_client.delete_object(Bucket=DATA_BUCKET, Key=processing_key)
+                continue
+
+            # Read request metadata
+            response = s3_client.get_object(Bucket=DATA_BUCKET, Key=processing_key)
+            request_data = json.loads(response['Body'].read())
+
+            # Download image and mask
+            image_obj = s3_client.get_object(Bucket=DATA_BUCKET, Key=request_data['imageKey'])
+            mask_obj = s3_client.get_object(Bucket=DATA_BUCKET, Key=request_data['maskKey'])
+
+            image_data = image_obj['Body'].read()
+            mask_data = mask_obj['Body'].read()
+
+            # Prepare payload
+            payload = {
+                'image': base64.b64encode(image_data).decode('utf-8'),
+                'mask': base64.b64encode(mask_data).decode('utf-8')
+            }
+
+            # Invoke SageMaker
+            print(f"  Invoking SageMaker endpoint...")
+            inference_response = sagemaker_runtime.invoke_endpoint(
+                EndpointName=ENDPOINT_NAME,
+                ContentType='application/json',
+                Body=json.dumps(payload)
+            )
+
+            # Save output PLY
+            output_key = request_data['imageKey'].replace('/input/', '/output/').replace('_image.png', '.ply')
+            s3_client.put_object(
+                Bucket=DATA_BUCKET,
+                Key=output_key,
+                Body=inference_response['Body'].read(),
+                ContentType='application/octet-stream'
+            )
+
+            # Update request metadata
+            request_data['status'] = 'completed'
+            request_data['completedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            request_data['outputKey'] = output_key
+
+            # Move to completed/ folder
+            completed_key = processing_key.replace('/queue/processing/', '/queue/completed/')
+            s3_client.put_object(
+                Bucket=DATA_BUCKET,
+                Key=completed_key,
+                Body=json.dumps(request_data, indent=2),
+                ContentType='application/json'
+            )
+
+            # Delete from processing/
+            s3_client.delete_object(Bucket=DATA_BUCKET, Key=processing_key)
+
+            print(f"  ✓ Completed: {output_key}")
+            processed += 1
+
+            # Trigger notification Lambda (asynchronously)
+            try:
+                lambda_client.invoke(
+                    FunctionName='Gen3DNotifyLambda',
+                    InvocationType='Event',
+                    Payload=json.dumps({
+                        'userId': request_data['userId'],
+                        'status': 'success',
+                        'outputKey': output_key,
+                        'requestId': request_data['requestId']
+                    })
+                )
+            except Exception as notify_error:
+                print(f"  ⚠️ Notification failed: {notify_error}")
+
+        except Exception as e:
+            print(f"  ✗ Failed: {str(e)}")
+            failed += 1
+
+            # Move to failed/ folder with error details
+            try:
+                # Read request data (if we got that far)
+                try:
+                    response = s3_client.get_object(Bucket=DATA_BUCKET, Key=processing_key)
+                    request_data = json.loads(response['Body'].read())
+                except:
+                    # If we couldn't move to processing, read from pending
+                    response = s3_client.get_object(Bucket=DATA_BUCKET, Key=request_key)
+                    request_data = json.loads(response['Body'].read())
+
+                request_data['status'] = 'failed'
+                request_data['failedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                request_data['error'] = str(e)
+
+                # Save to failed/ folder
+                failed_key = request_key.replace('/queue/pending/', '/queue/failed/')
+                if '/queue/processing/' in request_key:
+                    failed_key = request_key.replace('/queue/processing/', '/queue/failed/')
+
+                s3_client.put_object(
+                    Bucket=DATA_BUCKET,
+                    Key=failed_key,
+                    Body=json.dumps(request_data, indent=2),
+                    ContentType='application/json'
+                )
+
+                # Clean up
+                try:
+                    s3_client.delete_object(Bucket=DATA_BUCKET, Key=request_key)
+                except:
+                    pass
+                try:
+                    s3_client.delete_object(Bucket=DATA_BUCKET, Key=processing_key)
+                except:
+                    pass
+
+                # Create error file in output folder
+                error_key = request_data['imageKey'].replace('/input/', '/output/').replace('_image.png', '_error.json')
+                s3_client.put_object(
+                    Bucket=DATA_BUCKET,
+                    Key=error_key,
+                    Body=json.dumps({
+                        'error': str(e),
+                        'requestId': request_data['requestId'],
+                        'timestamp': time.time()
+                    }),
+                    ContentType='application/json'
+                )
+
+            except Exception as error_handling_error:
+                print(f"  ✗ Failed to handle error: {error_handling_error}")
+
+    print(f"\n✅ Summary: {processed} succeeded, {failed} failed")
+
+    return {
+        'statusCode': 200,
+        'processed': processed,
+        'failed': failed,
+        'total': len(pending_requests)
+    }
+```
+
+**Lambda Configuration:**
+```bash
+# Create Lambda function
+zip -j lambda_process_s3_queue.zip lambda_process_s3_queue.py
+
+aws lambda create-function \
+    --function-name Gen3DProcessS3QueueLambda \
+    --runtime python3.11 \
+    --role arn:aws:iam::ACCOUNT_ID:role/Gen3DLambdaRole \
+    --handler lambda_process_s3_queue.lambda_handler \
+    --zip-file fileb://lambda_process_s3_queue.zip \
+    --timeout 900 \
+    --memory-size 1024 \
+    --environment "Variables={
+        ENDPOINT_NAME=Gen3DSAMEndpoint,
+        DATA_BUCKET=gen3d-data-bucket
+    }"
+```
+
+---
+
+### Step 4: Configure S3 Event Notification
+
+```bash
+# Add Lambda permission for S3 to invoke
+aws lambda add-permission \
+    --function-name Gen3DQueueS3Lambda \
+    --statement-id AllowS3InvokeQueue \
+    --action lambda:InvokeFunction \
+    --principal s3.amazonaws.com \
+    --source-arn arn:aws:s3:::gen3d-data-bucket
+
+# Configure S3 notification
+cat > /tmp/s3-notification-queue.json << 'EOF'
+{
+  "LambdaFunctionConfigurations": [{
+    "Id": "Gen3DQueueTrigger",
+    "LambdaFunctionArn": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:Gen3DQueueS3Lambda",
+    "Events": ["s3:ObjectCreated:*"],
+    "Filter": {
+      "Key": {
+        "FilterRules": [
+          {"Name": "prefix", "Value": "users/"},
+          {"Name": "suffix", "Value": "_image.png"}
+        ]
+      }
+    }
+  }]
+}
+EOF
+
+aws s3api put-bucket-notification-configuration \
+    --bucket gen3d-data-bucket \
+    --notification-configuration file:///tmp/s3-notification-queue.json
+```
+
+---
+
+### Step 5: Optional - Automated Cleanup with S3 Lifecycle
+
+Instead of a Lambda function, use S3 lifecycle policies to automatically clean up old queue files:
+
+```bash
+cat > /tmp/s3-lifecycle-queue.json << 'EOF'
+{
+  "Rules": [
+    {
+      "Id": "CleanupCompletedRequests",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "users/"
+      },
+      "Transitions": [],
+      "Expiration": {
+        "Days": 7
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 1
+      }
+    },
+    {
+      "Id": "CleanupFailedRequests",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "users/"
+      },
+      "Transitions": [
+        {
+          "Days": 1,
+          "StorageClass": "STANDARD_IA"
+        }
+      ],
+      "Expiration": {
+        "Days": 30
+      }
+    }
+  ]
+}
+EOF
+
+aws s3api put-bucket-lifecycle-configuration \
+    --bucket gen3d-data-bucket \
+    --lifecycle-configuration file:///tmp/s3-lifecycle-queue.json
+```
+
+This automatically:
+- Deletes completed requests after 7 days
+- Moves failed requests to cheaper storage after 1 day
+- Deletes failed requests after 30 days
+
+---
+
+### Step 6: Monitoring Queue Status
+
+**View queue status directly in S3 Console:**
+```
+S3 Console → gen3d-data-bucket → users → {userId} → queue
+  → pending/    (requests waiting for processing)
+  → processing/ (currently being processed)
+  → completed/  (successfully processed)
+  → failed/     (failed requests)
+```
+
+**Or via AWS CLI:**
+```bash
+# Count pending requests
+aws s3 ls s3://gen3d-data-bucket/users/ --recursive | grep '/queue/pending/' | wc -l
+
+# Count completed requests
+aws s3 ls s3://gen3d-data-bucket/users/ --recursive | grep '/queue/completed/' | wc -l
+
+# Count failed requests
+aws s3 ls s3://gen3d-data-bucket/users/ --recursive | grep '/queue/failed/' | wc -l
+
+# View specific request details
+aws s3 cp s3://gen3d-data-bucket/users/user123/queue/completed/user123-1234567890-abc.json -
+```
+
+---
+
+### Step 7: Testing the Queue
+
+```bash
+# Upload test files
+aws s3 cp test_image.png s3://gen3d-data-bucket/users/test123/input/12345_image.png
+aws s3 cp test_mask.png s3://gen3d-data-bucket/users/test123/input/12345_mask.png
+
+# Check if request was queued
+aws s3 ls s3://gen3d-data-bucket/users/test123/queue/pending/
+
+# Wait for endpoint to start (5 minutes)
+# ...
+
+# Check if request was processed
+aws s3 ls s3://gen3d-data-bucket/users/test123/queue/completed/
+
+# View output
+aws s3 ls s3://gen3d-data-bucket/users/test123/output/
+```
+
+---
+
+## 💡 Solution 3: Key Advantages
+
+### 1. **Atomic Operations Prevent Race Conditions**
+
+The copy-then-delete pattern ensures only one Lambda processes each request:
+
+```python
+# Step 1: Copy to processing/ (multiple Lambdas can do this)
+s3_client.copy_object(...)
+
+# Step 2: Delete from pending/ (only ONE will succeed)
+s3_client.delete_object(...)  # If this fails, abort processing
+
+# If delete succeeds, you "own" this request
+```
+
+### 2. **Visual Queue Inspection**
+
+Unlike DynamoDB, you can **see the queue state visually** in S3 console:
+- How many requests are pending?
+- Which user has the most requests?
+- What's the oldest pending request?
+- View full request details with one click
+
+### 3. **Natural Audit Trail**
+
+Completed and failed requests are automatically preserved in S3:
+- Full history of all requests
+- Easy to query: "How many requests failed last week?"
+- No additional cost for audit logs
+
+### 4. **Simplified Debugging**
+
+When something goes wrong:
+1. Open S3 console
+2. Navigate to `failed/` folder
+3. Read the JSON file
+4. See exact error message and request details
+
+No need to query DynamoDB or parse CloudWatch logs.
+
+### 5. **Built-in Cleanup**
+
+S3 Lifecycle policies automatically:
+- Delete old completed requests
+- Archive old failed requests
+- No Lambda function needed for cleanup
+- Zero operational overhead
+
+---
+
 ## 📊 Comparison of Solutions
 
-| Feature | Step Functions | EventBridge + DynamoDB |
-|---------|---------------|------------------------|
-| **Complexity** | Medium | Medium |
-| **Visual Monitoring** | ✅ Yes (console) | ❌ No (logs only) |
-| **Retry Logic** | ✅ Built-in | ❌ Manual |
-| **State Persistence** | ✅ Automatic | ✅ DynamoDB |
-| **Cost** | $0.025/1000 executions | DynamoDB: ~$0.01/request |
-| **Debugging** | ✅ Easy (visual workflow) | ❌ Harder (CloudWatch logs) |
-| **Lambda Timeout Risk** | ✅ No risk | ✅ No risk |
-| **Event-Driven** | ⚠️ Polling (every 30s) | ✅ Pure events (no polling) |
-| **Batch Processing** | ❌ One at a time | ✅ Can batch multiple |
-| **Best For** | Complex workflows | Simple queue processing |
-| **Learning Curve** | Medium | Low (if familiar with AWS) |
-| **Operational Overhead** | Low | Medium (manage DynamoDB) |
-| **Scalability** | ✅ Excellent | ✅ Excellent |
+| Feature | Step Functions | EventBridge + DynamoDB | **EventBridge + S3** |
+|---------|---------------|------------------------|----------------------|
+| **Complexity** | Medium | Medium | **Low** |
+| **Visual Monitoring** | ✅ Yes (console) | ❌ No (logs only) | ✅ **Yes (S3 console)** |
+| **Retry Logic** | ✅ Built-in | ❌ Manual | ❌ Manual |
+| **State Persistence** | ✅ Automatic | ✅ DynamoDB | ✅ **S3** |
+| **Cost** | $0.025/1000 executions | ~$0.01/request | **~$0.0005/request** |
+| **Debugging** | ✅ Easy (visual workflow) | ❌ Harder (CloudWatch logs) | ✅ **Easiest (S3 files)** |
+| **Lambda Timeout Risk** | ✅ No risk | ✅ No risk | ✅ No risk |
+| **Event-Driven** | ⚠️ Polling (every 30s) | ✅ Pure events | ✅ Pure events |
+| **Batch Processing** | ❌ One at a time | ✅ Can batch multiple | ✅ Can batch multiple |
+| **Audit Trail** | ⚠️ Execution history (90 days) | ❌ Manual | ✅ **Automatic (S3)** |
+| **Queue Visibility** | ⚠️ Via API only | ⚠️ Via DynamoDB | ✅ **Visual (S3 console)** |
+| **Additional Services** | Step Functions | DynamoDB | **None (S3 only)** |
+| **Data Locality** | State separate from data | State in DynamoDB | **State with data (S3)** |
+| **Cleanup** | Automatic (90 days) | Manual Lambda | ✅ **S3 Lifecycle** |
+| **Best For** | Complex workflows | Structured queries | **Simple, cost-effective** |
 
 ---
 
@@ -1028,27 +1721,69 @@ aws events put-targets \
 - Total additional cost: ~$0.002/month (negligible)
 ```
 
-**Both solutions add < $0.01/month in cost** - essentially free.
+### EventBridge + S3 Approach (CHEAPEST):
+```
+100 requests/month:
+- EventBridge: Free (included)
+- S3 PUT (queue file): 100 × $0.000005 = $0.0005
+- S3 COPY (move to processing): 100 × $0.000005 = $0.0005
+- S3 LIST (find pending): 1 × $0.005 = $0.005
+- S3 GET (read request): 100 × $0.0000004 = $0.00004
+- S3 DELETE (cleanup): 200 × $0.0000004 = $0.00008
+- S3 storage: 100 items × 1KB × $0.023/GB = $0.0000023
+- Total additional cost: ~$0.0006/month (essentially free)
+```
+
+**Cost comparison:**
+- Solution 1 (Step Functions): $0.003/month
+- Solution 2 (DynamoDB): $0.002/month
+- **Solution 3 (S3): $0.0006/month** ← **70% cheaper than DynamoDB, 80% cheaper than Step Functions**
+
+**All solutions add < $0.01/month in cost** - essentially free.
 
 ---
 
 ## 🎯 Recommendation
 
+### Use **EventBridge + S3 (Solution 3)** if: ⭐ **RECOMMENDED**
+
+- ✅ You want the **simplest architecture**
+- ✅ You want the **lowest cost** (80% cheaper than Step Functions)
+- ✅ You value **visual queue inspection** (S3 console)
+- ✅ You want **natural data organization** (state with data)
+- ✅ You need **automatic audit trail**
+- ✅ You prefer **zero operational overhead** (S3 lifecycle cleanup)
+- ✅ You want **easiest debugging** (just read JSON files)
+- ✅ You're building a **straightforward queue system**
+
+**Best for**: Most users. Simple, elegant, cost-effective.
+
+---
+
 ### Use **Step Functions (Solution 1)** if:
 
-- ✅ You want visual workflow monitoring
+- ✅ You want visual workflow monitoring with execution graphs
 - ✅ You prefer AWS-managed state persistence
 - ✅ You want built-in retry/error handling
-- ✅ You're building complex workflows
-- ✅ You value ease of debugging
+- ✅ You're building complex multi-step workflows
+- ✅ You need advanced orchestration (parallel steps, conditions)
+- ✅ You value integrated error handling
+- ✅ You're comfortable with higher cost ($0.003/month vs $0.0006/month)
+
+**Best for**: Complex workflows with multiple orchestrated steps.
+
+---
 
 ### Use **EventBridge + DynamoDB (Solution 2)** if:
 
-- ✅ You prefer pure event-driven (no polling)
-- ✅ You want to batch process multiple requests
-- ✅ You need fine-grained control over queue management
+- ✅ You need complex queries on queue data (by status, timestamp, user)
+- ✅ You want TTL-based automatic cleanup
+- ✅ You need transactional updates
 - ✅ You're already using DynamoDB extensively
-- ✅ You want to minimize AWS service dependencies
+- ✅ You need atomic conditional writes
+- ✅ You require sub-millisecond query performance
+
+**Best for**: Applications requiring structured database queries on queue data.
 
 ---
 
@@ -1068,28 +1803,63 @@ To migrate from the current flawed design to Step Functions:
 
 ## 📈 Additional Benefits
 
-### With Either Solution:
+### With All Three Solutions:
 
 1. **Request Tracking**: Every request has a unique ID and full history
-2. **Failure Recovery**: Automatic retries on transient failures
-3. **Monitoring**: CloudWatch metrics for success/failure rates
-4. **Cost Efficiency**: Pay only for execution time, not waiting time
-5. **Scalability**: Handles 1 request/month or 10,000/month equally well
-6. **User Experience**: Reliable processing with proper error notifications
+2. **No Lambda Timeout Risk**: Lambda returns immediately, no waiting for endpoint
+3. **Failure Recovery**: Proper error handling and state tracking
+4. **Monitoring**: CloudWatch metrics for success/failure rates
+5. **Cost Efficiency**: Pay only for execution time, not waiting time
+6. **Scalability**: Handles 1 request/month or 10,000/month equally well
+7. **User Experience**: Reliable processing with proper error notifications
+
+### Solution 3 (S3) Additional Benefits:
+
+8. **Visual Debugging**: Browse queue folders in S3 console
+9. **Natural Organization**: Queue state lives with data
+10. **Zero Cleanup Cost**: S3 lifecycle policies handle it
+11. **Built-in Audit Trail**: Completed/failed requests preserved
+12. **Simplest Architecture**: No additional services beyond S3
 
 ---
 
 ## 🔧 Next Steps
 
-**Recommendation**: Implement **Step Functions Solution** for robust, production-ready architecture.
+**Primary Recommendation**: Implement **Solution 3 (EventBridge + S3)** for:
+- Simplest architecture
+- Lowest cost (80% cheaper)
+- Easiest debugging
+- Best for most use cases
 
-Would you like me to:
-1. Update the Cost Analysis document to replace Option 3 with Step Functions approach?
-2. Update the Implementation Plan v1.1 with Step Functions deployment steps?
-3. Create deployment scripts to automate the entire setup?
+**Alternative**: Implement **Solution 1 (Step Functions)** if you need complex workflow orchestration.
+
+**Deployment Options:**
+1. Update the Cost Analysis document to replace Option 3 with EventBridge + S3 approach
+2. Update the Implementation Plan v1.1 with chosen solution deployment steps
+3. Create automated deployment scripts for your chosen solution
+4. Set up monitoring and alerting for the queue system
 
 ---
 
-**Document Version**: 1.0
+## 📝 Decision Matrix
+
+| Requirement | Solution 1 | Solution 2 | Solution 3 |
+|-------------|-----------|-----------|-----------|
+| Simple architecture | ⚠️ Medium | ⚠️ Medium | ✅ **Best** |
+| Lowest cost | ❌ $0.003 | ⚠️ $0.002 | ✅ **$0.0006** |
+| Visual monitoring | ✅ Workflow | ❌ None | ✅ **S3 console** |
+| Easy debugging | ✅ Good | ❌ Logs only | ✅ **Easiest** |
+| Complex workflows | ✅ **Best** | ❌ No | ❌ No |
+| Built-in retries | ✅ **Yes** | ❌ Manual | ❌ Manual |
+| Audit trail | ⚠️ 90 days | ❌ Manual | ✅ **Automatic** |
+| Learning curve | ⚠️ Medium | ⚠️ Medium | ✅ **Low** |
+| Operational overhead | ✅ Low | ⚠️ Medium | ✅ **Lowest** |
+
+**Winner for Gen3D**: **Solution 3 (EventBridge + S3)** ⭐
+
+---
+
+**Document Version**: 2.0
 **Date**: 2025-11-27
+**Last Updated**: Added Solution 3 (EventBridge + S3)
 **Status**: Ready for Implementation ✅
