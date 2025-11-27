@@ -478,28 +478,287 @@ EOF
 
 ## Phase 3: SageMaker Model Deployment
 
-### Step 3.1: Prepare SAM 3D Model
+### Step 3.1: Obtain HuggingFace Access Token
 
-**Clone and prepare the model**:
+**You need a HuggingFace Access Token** (not username/password) to download the SAM 3D model.
+
+#### How to Get Your HuggingFace Access Token:
+
+**1. Create/Login to HuggingFace Account**
+- Visit: https://huggingface.co
+- Sign up or log in with your credentials
+
+**2. Accept SAM 3D Model License**
+- Visit: https://huggingface.co/facebook/sam-3d-objects
+- Click **"Agree and access repository"**
+- Review and accept Meta's SAM License terms
+- This grants your account permission to download the model
+
+**3. Generate Access Token**
+- Go to: https://huggingface.co/settings/tokens
+- Click **"New token"**
+- Token name: `Gen3D-SAM3D` (or your preferred name)
+- Token type: **"Read"** (sufficient for downloading models)
+- Click **"Generate token"**
+- **IMPORTANT**: Copy and save the token immediately (starts with `hf_...`)
+- You won't be able to see it again!
+
+**Security Note**: Never commit your token to git. It's already excluded in `.gitignore`.
+
+---
+
+### Step 3.2: Install HuggingFace Hub Library
 
 ```bash
+# Install HuggingFace Hub with CLI support
+pip install -U "huggingface_hub[cli]"
+
+# Verify installation
+python -c "import huggingface_hub; print(f'HuggingFace Hub v{huggingface_hub.__version__} installed')"
+```
+
+---
+
+### Step 3.3: Authenticate with HuggingFace
+
+Choose one of the following methods to authenticate:
+
+#### Method 1: Python Login (Recommended - Works on All Platforms)
+
+```bash
+# Create and run a Python script to login
+python << 'PYTHON_EOF'
+from huggingface_hub import login
+
+# Replace with your actual token
+token = "hf_your_token_here"
+
+login(token=token)
+print("✓ Successfully logged in to HuggingFace")
+print("✓ Token stored in ~/.cache/huggingface/token")
+PYTHON_EOF
+```
+
+#### Method 2: Interactive CLI Login (Linux/Mac/Windows)
+
+```bash
+# This works on Windows Git Bash too
+python -m huggingface_hub.commands.huggingface_cli login
+
+# You'll be prompted to paste your token
+# The token will be stored securely
+```
+
+#### Method 3: Environment Variable (Temporary)
+
+```bash
+# For Linux/Mac/Git Bash
+export HUGGING_FACE_HUB_TOKEN=hf_your_token_here
+
+# For Windows CMD
+set HUGGING_FACE_HUB_TOKEN=hf_your_token_here
+
+# For Windows PowerShell
+$env:HUGGING_FACE_HUB_TOKEN="hf_your_token_here"
+```
+
+#### Verify Authentication
+
+```bash
+python << 'PYTHON_EOF'
+from huggingface_hub import whoami
+try:
+    user_info = whoami()
+    print(f"✓ Authenticated as: {user_info['name']}")
+    print(f"✓ Account type: {user_info.get('type', 'user')}")
+except Exception as e:
+    print(f"✗ Authentication failed: {e}")
+    print("Make sure you've set your token correctly")
+PYTHON_EOF
+```
+
+---
+
+### Step 3.4: Download SAM 3D Model from HuggingFace
+
+**Clone SAM 3D repository and download model weights**:
+
+```bash
+# Create working directory
+mkdir -p /tmp/gen3d-build
+cd /tmp/gen3d-build
+
 # Clone SAM 3D repository
-cd /tmp
+echo "Cloning SAM 3D repository..."
 git clone https://github.com/facebookresearch/sam-3d-objects.git
 cd sam-3d-objects
 
 # Install dependencies
+echo "Installing Python dependencies..."
 pip install -r requirements.txt
 pip install -r requirements.inference.txt
 
-# Download model checkpoints from HuggingFace
+# Create checkpoints directory
 mkdir -p checkpoints/hf
-# Note: Use HuggingFace CLI or API to download
-# huggingface-cli login
-# huggingface-cli download facebook/sam-3d-objects --local-dir checkpoints/hf
+
+# Download model from HuggingFace using Python
+echo "Downloading SAM 3D model from HuggingFace..."
+echo "This may take several minutes (model is several GB)..."
+
+python << 'PYTHON_EOF'
+from huggingface_hub import snapshot_download
+import os
+
+try:
+    print("Starting download...")
+    snapshot_download(
+        repo_id="facebook/sam-3d-objects",
+        local_dir="checkpoints/hf",
+        local_dir_use_symlinks=False,
+        resume_download=True,
+        ignore_patterns=["*.git*", "*.md"]  # Skip git files and docs
+    )
+    print("\n✓ Model downloaded successfully to checkpoints/hf/")
+
+    # List downloaded files
+    print("\nDownloaded files:")
+    for root, dirs, files in os.walk("checkpoints/hf"):
+        level = root.replace("checkpoints/hf", "").count(os.sep)
+        indent = " " * 2 * level
+        print(f"{indent}{os.path.basename(root)}/")
+        subindent = " " * 2 * (level + 1)
+        for file in files[:10]:  # Show first 10 files
+            print(f"{subindent}{file}")
+        if len(files) > 10:
+            print(f"{subindent}... and {len(files)-10} more files")
+
+except Exception as e:
+    print(f"\n✗ Download failed: {e}")
+    print("\nTroubleshooting:")
+    print("1. Make sure you've accepted the model license at:")
+    print("   https://huggingface.co/facebook/sam-3d-objects")
+    print("2. Verify your token is valid:")
+    print("   python -c 'from huggingface_hub import whoami; print(whoami())'")
+    print("3. Check your internet connection")
+    exit(1)
+PYTHON_EOF
+
+# Verify critical files exist
+echo ""
+echo "Verifying downloaded files..."
+if [ -f "checkpoints/hf/pipeline.yaml" ]; then
+    echo "✓ pipeline.yaml found"
+else
+    echo "✗ pipeline.yaml missing - download may be incomplete"
+    exit 1
+fi
+
+echo ""
+echo "✓ SAM 3D model ready for deployment"
 ```
 
-### Step 3.2: Create Custom Inference Container
+**Alternative: Download Specific Files Only (If Full Download Fails)**
+
+```bash
+python << 'PYTHON_EOF'
+from huggingface_hub import hf_hub_download
+import os
+
+repo_id = "facebook/sam-3d-objects"
+local_dir = "checkpoints/hf"
+
+# Essential files (adjust based on actual model structure)
+essential_files = [
+    "pipeline.yaml",
+    "config.json",
+    "model.safetensors",  # or model.bin
+]
+
+os.makedirs(local_dir, exist_ok=True)
+
+print("Downloading essential model files...")
+for filename in essential_files:
+    try:
+        print(f"  Downloading {filename}...", end=" ")
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=local_dir,
+            local_dir_use_symlinks=False
+        )
+        print("✓")
+    except Exception as e:
+        print(f"✗ ({e})")
+
+print("\nDownload complete!")
+PYTHON_EOF
+```
+
+---
+
+### Step 3.5: Store HuggingFace Token in AWS Secrets Manager
+
+For SageMaker to access the model or download updates, store the token securely in AWS:
+
+```bash
+# Store HuggingFace token in AWS Secrets Manager
+aws secretsmanager create-secret \
+    --name Gen3D/HuggingFaceToken \
+    --description "HuggingFace API token for SAM 3D model access" \
+    --secret-string "{\"token\":\"hf_your_token_here\"}" \
+    --region $AWS_REGION
+
+# Verify secret was created
+aws secretsmanager describe-secret \
+    --secret-id Gen3D/HuggingFaceToken \
+    --region $AWS_REGION
+
+# Get the secret ARN for later use
+HF_TOKEN_ARN=$(aws secretsmanager describe-secret \
+    --secret-id Gen3D/HuggingFaceToken \
+    --query ARN --output text)
+
+echo "✓ HuggingFace token stored in AWS Secrets Manager"
+echo "Secret ARN: $HF_TOKEN_ARN"
+```
+
+**Update SageMaker IAM Role to Access Secret**:
+
+```bash
+# Add Secrets Manager permissions to SageMaker role
+cat > /tmp/sagemaker-secrets-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:*:*:secret:Gen3D/*"
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+    --role-name Gen3DSageMakerExecutionRole \
+    --policy-name Gen3DSecretsManagerPolicy \
+    --policy-document file:///tmp/sagemaker-secrets-policy.json
+
+echo "✓ SageMaker role updated with Secrets Manager access"
+```
+
+---
+
+### Step 3.6: Create Custom Inference Container
+
+**Ensure you're in the sam-3d-objects directory**:
+
+```bash
+cd /tmp/gen3d-build/sam-3d-objects
+```
 
 **Create Dockerfile**:
 
@@ -705,7 +964,7 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
 ```
 
-### Step 3.3: Build and Push Container to ECR
+### Step 3.7: Build and Push Container to ECR
 
 ```bash
 # Create ECR repository
@@ -729,7 +988,7 @@ docker tag gen3d-sam3d-inference:latest \
 docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/gen3d-sam3d-inference:latest
 ```
 
-### Step 3.4: Create SageMaker Model
+### Step 3.8: Create SageMaker Model
 
 ```bash
 # Get IAM role ARN
@@ -747,7 +1006,7 @@ aws sagemaker create-model \
     --execution-role-arn $SAGEMAKER_ROLE_ARN
 ```
 
-### Step 3.5: Create Async Endpoint Configuration
+### Step 3.9: Create Async Endpoint Configuration
 
 ```bash
 # Create async inference configuration
@@ -777,7 +1036,7 @@ aws sagemaker create-endpoint-config \
     --async-inference-config file:///tmp/async-config.json
 ```
 
-### Step 3.6: Create Async Endpoint
+### Step 3.10: Create Async Endpoint
 
 ```bash
 # Create endpoint
