@@ -539,14 +539,19 @@ print("✓ Token stored in ~/.cache/huggingface/token")
 PYTHON_EOF
 ```
 
-#### Method 2: Interactive CLI Login (Linux/Mac/Windows)
+#### Method 2: CLI Login (Recommended - Works on All Platforms)
 
 ```bash
-# This works on Windows Git Bash too
-python -m huggingface_hub.commands.huggingface_cli login
+# Interactive login - you'll be prompted for your token
+hf auth login
 
-# You'll be prompted to paste your token
-# The token will be stored securely
+# The token will be stored securely in ~/.cache/huggingface/token
+```
+
+**Verify login**:
+```bash
+# Check who you're logged in as
+hf auth whoami
 ```
 
 #### Method 3: Environment Variable (Temporary)
@@ -601,10 +606,35 @@ pip install -r requirements.inference.txt
 # Create checkpoints directory
 mkdir -p checkpoints/hf
 
-# Download model from HuggingFace using Python
+# Download model from HuggingFace using CLI (Recommended)
 echo "Downloading SAM 3D model from HuggingFace..."
 echo "This may take several minutes (model is several GB)..."
 
+hf download facebook/sam-3d-objects \
+    --local-dir checkpoints/hf \
+    --repo-type model
+
+# Verify critical files exist
+echo ""
+echo "Verifying downloaded files..."
+if [ -f "checkpoints/hf/pipeline.yaml" ]; then
+    echo "✓ pipeline.yaml found"
+else
+    echo "✗ pipeline.yaml missing - download may be incomplete"
+    echo "Troubleshooting:"
+    echo "1. Make sure you've logged in: hf auth login"
+    echo "2. Accept the model license at: https://huggingface.co/facebook/sam-3d-objects"
+    echo "3. Verify login: hf auth whoami"
+    exit 1
+fi
+
+echo ""
+echo "✓ SAM 3D model ready for deployment"
+```
+
+**Alternative Method: Python API (If CLI fails)**
+
+```bash
 python << 'PYTHON_EOF'
 from huggingface_hub import snapshot_download
 import os
@@ -642,24 +672,17 @@ except Exception as e:
     print("3. Check your internet connection")
     exit(1)
 PYTHON_EOF
-
-# Verify critical files exist
-echo ""
-echo "Verifying downloaded files..."
-if [ -f "checkpoints/hf/pipeline.yaml" ]; then
-    echo "✓ pipeline.yaml found"
-else
-    echo "✗ pipeline.yaml missing - download may be incomplete"
-    exit 1
-fi
-
-echo ""
-echo "✓ SAM 3D model ready for deployment"
 ```
 
-**Alternative: Download Specific Files Only (If Full Download Fails)**
+**Alternative: Download Specific Files Only (Faster)**
 
 ```bash
+# Download only essential files instead of entire repository
+hf download facebook/sam-3d-objects pipeline.yaml --local-dir checkpoints/hf
+hf download facebook/sam-3d-objects config.json --local-dir checkpoints/hf
+# Add other specific files as needed
+
+# Or using Python API
 python << 'PYTHON_EOF'
 from huggingface_hub import hf_hub_download
 import os
