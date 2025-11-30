@@ -1,0 +1,62 @@
+sequenceDiagram
+    autonumber
+
+    box "Client Side" #f9f9f9
+        actor User
+        participant Browser as Client (Browser)
+    end
+
+    box "AWS Cloud" #ececec
+        participant S3 as AWS S3 (Storage)
+        participant Lambda as AWS Lambda (API)
+        participant SM as SageMaker Async (GPU)
+    end
+
+    Note over User, SM: STAGE 1: INITIALIZATION (Heavy Encode)
+
+    User->>Browser: Uploads Image
+    Browser->>S3: Upload "image.jpg" (Presigned URL)
+    S3-->>Browser: 200 OK (S3 Key)
+    
+    Browser->>Lambda: Request Init (Task="get_embedding", S3_Key)
+    Lambda->>SM: Invoke Endpoint Async (InputLocation=S3_Key)
+    Lambda-->>Browser: Return JobID (202 Accepted)
+    
+    par Async Processing
+        SM->>S3: Download "image.jpg"
+        SM->>SM: Run SAM 3 Image Encoder (ViT-H)
+        SM->>S3: Save "embeddings.json" (4MB)
+    end
+
+    Browser->>S3: Poll/Download "embeddings.json"
+    S3-->>Browser: Return Embeddings
+
+    Note over User, SM: STAGE 2: INTERACTION (Zero Latency)
+
+    Browser->>Browser: Load SAM Mask Decoder (ONNX)
+    
+    loop User Interaction
+        User->>Browser: Click / Hover on Object
+        Browser->>Browser: Generate Mask (Milliseconds)
+        Browser-->>User: Update Canvas Overlay
+    end
+    
+    User->>Browser: Confirm Selection
+
+    Note over User, SM: STAGE 3: 3D RECONSTRUCTION (Server Generation)
+
+    Browser->>Browser: Convert Canvas Mask to PNG
+    Browser->>S3: Upload "mask.png"
+    
+    Browser->>Lambda: Request 3D (Task="generate_3d", Img_Key, Mask_Key)
+    Lambda->>SM: Invoke Endpoint Async (InputConfig)
+    Lambda-->>Browser: Return JobID
+    
+    par Async Processing
+        SM->>S3: Download "image.jpg" & "mask.png"
+        SM->>SM: Run SAM 3D (Reconstruction)
+        SM->>S3: Save "object.obj" (Mesh)
+    end
+
+    Browser->>S3: Download "object.obj"
+    Browser-->>User: Render 3D Model (Three.js)
